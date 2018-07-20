@@ -40,7 +40,9 @@ Kafka 在缓存和存储消息上对文件系统有很强的依赖，现在外�
 
 ### 常数时间就够了
 
-在消息队列系统里的持久数据结构经常使用每个消费者队列有一个对应的B树或者其他通用的随机访问数据结构来保存消息的元数据(metadata)。
+ 消息队列里使用的持久化数据结构一般是每个队列采用一个对应一个 B 树或者其他利于随机读的数据结构。B树是最通用的数据结构，并且使消息系统能够支持事务型和非事务型的场景。尽管 B 树依然有较大的消耗：B 树的操作复杂度是 O(logN), 通常情况下，O(logN) 的复杂度被认为是常数时间，但是对于磁盘操作来说并不是如此。一次磁盘寻道操作需要10 ms，并且每个磁盘每次只能做一次磁盘寻道，所以也限制了并发。因此磁盘寻道也会有非常高的消耗。存储系统是非常快速的缓存操作和非常慢的磁盘操作的混合，在固定的缓存下，树结构的性能是随着数据量增长而超线性损失的。数据增长两倍会使之前的操作变慢超过两倍。
+
+直觉上一个持久化队列可以通过顺序写文件来实现。这样的好处是所有的操作都是 O(1) 的，并且读写不会互相影响。这样的好处是性能完全和数据的大小解耦合了，一台服务器可以完全利用一块便宜的低转速的1TB SATA 硬盘。尽管它的寻道性能非常差，但是对于大量的读写操作可以做到 1/3 的价格换回3倍的容量。
 
 ## 3 效率
 
@@ -48,7 +50,29 @@ Kafka 在缓存和存储消息上对文件系统有很强的依赖，现在外�
 
 
 我们在性能上花了非常多力气。其中我们有一个主要场景是处理 web 的活跃数据，数据量非常大：每次访问一个页面都可能会产生数十次写操作。不仅如此，我们假设每条信息被至少一个消费者所用，所以我们努力使性能尽可能要好。
+
+We have also found, from experience building and running a number of similar systems, that efficiency is a key to effective multi-tenant operations. If the downstream infrastructure service can easily become a bottleneck due to a small bump in usage by the application, such small changes will often create problems. By being very fast we help ensure that the application will tip-over under load before the infrastructure. This is particularly important when trying to run a centralized service that supports dozens or hundreds of applications on a centralized cluster as changes in usage patterns are a near-daily occurrence.
+
 之前我们讨论了磁盘效率的问题，一旦糟糕的磁盘访问方式被限制之后，在这种类型的系统里只有两个会影响效率的因素：太多小型的 I/O 操作，以及过多的拷贝。
+
+小的 I/O 操作在客户端，服务器端，服务器端持久化操作都会发生。
+
+为了避免这样的操作，我们使用了一个 message set 的抽象将消息汇聚在一起。这使得网络请求把消息聚合在一起再发送过来，避免消息一条条地传输。服务端将消息一次性写进日志里，消费者也一次性读取多条消息。
+
+这个小小的优化带来了巨大的速度提升，批处理导致了更大的网络包，更大的顺序磁盘操作，连续的内存块 等等，这一切使得 kafka 把随机的消息流转变为顺序写操作并流向消费者。
+
+另一个性能的瓶颈在字节的拷贝上。在消息较少的情况下这不是一个问题，但是在负载较大的情况下就会有显著的影响。为了避免这样的消息拷贝，我们采用一套标准的二进制消息格式，通用于生产者，消费者，和服务端。
+
+被服务端维护的消息日志只是文件夹里的一堆文件。通过维护统一的消息格式我们可以优化最重要的操作：通过网络传输日志文件。现代的 unix 操作系统提供了一套被优化的代码，用于将数据从页缓存中传输到套接字里，在 Linux 里使用 sendfile 这个系统调用来完成。
+
+为了了解 sendfile 的影响，我们先来看一下正常情况下一个数据块是如何被传输到套接字上的：
+
+1. 操作系统把磁盘上的数据读到内核空间中的页缓存里
+2. 应用程序将内核空间中的数据读到用户空间中的 buffer 里
+3. 应用程序将数据写回到内核空间中的套接字 buffer 里
+4. 操作系统把数据从套接字 buffer 拷贝到 NIC buffer 里并传输给网络
+
+这很明显不高效，
 
 4 The Producer(生产者)
 
